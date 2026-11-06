@@ -7,20 +7,30 @@ using Microsoft.EntityFrameworkCore;
 
 namespace HotelAPI.Repositories
 {
+    // ==========================================
+    // EL REPOSITORIO (Arquitectura Híbrida: Dapper + EF Core)
+    // ==========================================
+    // Aquí aplicamos CQRS Lite: Lecturas con Dapper (rápido) y Escrituras con EF Core (seguro).
     public class ReservaRepository
     {
-        private readonly HotelContext _context;
-        private readonly string _connectionString;
+        private readonly HotelContext _context;// Para escritura (EF Core)
+        private readonly string _connectionString;// Para lectura (Dapper)
 
         public ReservaRepository(HotelContext context, IConfiguration config)
         {
             _context = context;
             _connectionString = config.GetConnectionString("DefaultConnection")!;
         }
-                
+
+        // ==========================================
+        // 1. LECTURA (GET) CON DAPPER
+        // ==========================================
         public async Task<IEnumerable<ReservaLecturaDTO>> ObtenerTodasAsync()
         {
+            // Dapper abre una conexión directa y ligera a SQL Server.
             using var connection = new SqlConnection(_connectionString);
+
+            // Hacemos un INNER JOIN para traer el nombre del usuario en una sola consulta.
             var sql = @"
                 SELECT 
                     r.Id, 
@@ -32,11 +42,16 @@ namespace HotelAPI.Repositories
                 INNER JOIN Usuarios u ON r.UsuarioId = u.Id
                 ORDER BY r.FechaReserva DESC";
 
+            // Dapper mapea el resultado directamente a nuestro DTO de lectura.
             return await connection.QueryAsync<ReservaLecturaDTO>(sql);
         }
-                
+
+        // ==========================================
+        // 2. ESCRITURA (POST) CON EF CORE Y TRANSACCIÓN
+        // ==========================================
         public async Task<int> CrearReservaAsync(CrearReservaDTO dto)
-        {            
+        {
+            // PASO A: Abrimos la "bóveda" (Transacción). Nada se guarda hasta el Commit.
             using var transaction = await _context.Database.BeginTransactionAsync();
             try
             {
@@ -46,16 +61,20 @@ namespace HotelAPI.Repositories
                     UsuarioId = dto.UsuarioId,
                     FechaReserva = DateTime.Now
                 };
-                                
+
+                // PASO B: Recorremos las habitaciones que envió el usuario en el DTO.
                 foreach (var item in dto.Detalles)
                 {
+                    // Buscamos la habitación en la BD para obtener su Precio real (evita hackeos).
                     var habitacion = await _context.Habitaciones.FindAsync(item.HabitacionId);
                     if (habitacion == null)
                         throw new Exception($"La habitación con ID {item.HabitacionId} no existe.");
 
+                    // Calculamos el subtotal en el servidor (Precio * Noches).
                     decimal subtotal = habitacion.Precio * item.Noches;
                     totalCalculado += subtotal;
-                                        
+
+                    // Agregamos el detalle al HashSet de la reserva en memoria.
                     nuevaReserva.Detalles.Add(new ReservaDetalle
                     {
                         HabitacionId = item.HabitacionId,
@@ -63,7 +82,8 @@ namespace HotelAPI.Repositories
                         Subtotal = subtotal
                     });
                 }
-                                
+
+                // PASO C: Procesamos los servicios adicionales (Relación N:M).
                 if (dto.ServiciosAdicionalesIds != null && dto.ServiciosAdicionalesIds.Any())
                 {
                     var servicios = await _context.ServiciosAdicionales
@@ -73,26 +93,34 @@ namespace HotelAPI.Repositories
                     foreach (var servicio in servicios)
                     {
                         totalCalculado += servicio.Precio;
-                        nuevaReserva.Servicios.Add(servicio);
+                        nuevaReserva.Servicios.Add(servicio);// EF Core llenará la tabla intermedia
                     }
                 }
 
+                // PASO D: Asignamos el Total final y preparamos el INSERT.
                 nuevaReserva.Total = totalCalculado;
                 _context.Reservas.Add(nuevaReserva);
-                                
+
+                // PASO E: Guardamos los cambios. (Aquí se ejecutan los INSERT reales).
                 await _context.SaveChangesAsync();
 
+                // PASO F: Si todo salió bien, confirmamos la transacción.
                 await transaction.CommitAsync();
 
                 return nuevaReserva.Id;
             }
             catch (Exception)
-            {                
+            {
+                // PASO G: ¡ERROR! Si algo falló (ej. la habitación no existía), 
+                // deshacemos TODO. Ningún dato a medias se queda en la BD (Rollback).
                 await transaction.RollbackAsync();
-                throw;
+                throw;// Lanzamos el error para que el Controlador lo atrape.
             }
         }
-               
+
+        // ==========================================
+        // 3. ACTUALIZAR Y ELIMINAR (EF Core)
+        // ==========================================
         public async Task<bool> ActualizarAsync(Reserva reserva)
         {            
             if (!await _context.Reservas.AnyAsync(r => r.Id == reserva.Id))
@@ -107,18 +135,24 @@ namespace HotelAPI.Repositories
         {
             var reserva = await _context.Reservas.FindAsync(id);
             if (reserva == null) return false;
-                        
+
+            // El Cascade que configuramos en el DbContext borrará los ReservaDetalles automáticamente.
             _context.Reservas.Remove(reserva);
             await _context.SaveChangesAsync();
             return true;
         }
 
-        // GET: Reporte detallado de reservas (Usando Dapper)
+        // ==========================================
+        // 4. REPORTE DETALLADO (Voucher con Dapper)
+        // ==========================================
         public async Task<IEnumerable<ReservaCompletaDTO>> ObtenerReporteCompletoAsync()
         {
             using var connection = new SqlConnection(_connectionString);
 
-            // Usamos un GROUP_CONCAT simulado en SQL Server para agrupar textos
+            // ¿Qué es STUFF y FOR XML PATH? 
+            // Es un "truco" de SQL Server para concatenar filas en una sola cadena de texto.
+            // Por ejemplo, si una reserva tiene las habitaciones "101" y "102", 
+            // el resultado será: "101, 102" en una sola celda.
             var sql = @"
                 SELECT 
                     r.Id AS IdReserva,
@@ -146,14 +180,14 @@ namespace HotelAPI.Repositories
                 INNER JOIN Usuarios u ON r.UsuarioId = u.Id
                 ORDER BY r.FechaReserva DESC";
 
-            // Dapper nos devuelve los datos planos
+            // Usamos 'dynamic' porque el resultado trae strings separados por comas que debemos procesar.
             var resultado = await connection.QueryAsync<dynamic>(sql);
 
             // Como Dapper trae los strings separados por comas, los convertimos a Listas
             var listaFinal = new List<ReservaCompletaDTO>();
             foreach (var item in resultado)
             {
-                // Convertimos a string por si Dapper devuelve un array
+                // Convertimos a string de forma segura por si viene nulo.
                 string habitacionesStr = item.HabitacionesReservadas?.ToString() ?? "";
                 string serviciosStr = item.ServiciosAdicionales?.ToString() ?? "";
 
@@ -165,7 +199,8 @@ namespace HotelAPI.Repositories
                     FechaReserva = item.FechaReserva,
                     Total = item.Total,
 
-                    // Ahora hacemos el split de forma segura
+                    // Hacemos un Split (cortamos el texto) usando la coma y el espacio como separador.
+                    // Así convertimos "101, 102" en una lista real de C#: ["101", "102"].
                     HabitacionesReservadas = string.IsNullOrEmpty(habitacionesStr)
                         ? new List<string>()
                         : habitacionesStr.Split(new[] { ", " }, StringSplitOptions.None).ToList(),
